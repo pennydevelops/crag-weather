@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crag Weather</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0
+1rem; }
+button { margin: 0.25rem; padding: 0.5rem 0.9rem; font-size: 1rem; cursor: pointer; }
+.day { border: 1px solid #ccc; border-radius: 8px; padding: 0.75rem; margin: 0.5rem 0; }
+.Climbable { background: #e6f7ea; }
+.Marginal { background: #fff6dc; }
+.Too { background: #fde7e7; }
+</style>
+</head>
+<body>
+<h1>Crag Weather</h1>
+<p>Pick a crag to see the next three days.</p>
+{% for crag in crags %}
+<button onclick="load('{{ crag.id }}')">{{ crag.name }}</button>
+{% endfor %}
+<div id="result"></div>
+<script>
+async function load(id) {
+const res = await fetch('/api/crags/' + id + '/forecast');
+const data = await res.json();
+const box = document.getElementById('result');
+box.innerHTML = '<h2>' + data.crag + '</h2>';
+for (const d of data.days) {
+const cls = d.verdict.startsWith('Too') ? 'Too' : d.verdict;
+box.innerHTML += `<div class="day ${cls}">
+<strong>${d.date}</strong> &mdash; ${d.verdict}<br>
+Temp ${d.temp_min}&deg;C to ${d.temp_max}&deg;C,
+rain chance ${d.rain_chance}%, wind ${d.wind_kmh} km/h
+</div>`;
+}
+}
+</script>
+</body>
+</html>
