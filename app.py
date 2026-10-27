@@ -68,6 +68,9 @@ def crag_forecast(crag_id):
         })
     return jsonify({"crag": crag["name"], "days": days})
 
+@app.route("/api/break")
+def break_app():
+       raise ValueError("Deliberate test error for Dynatrace")
 
 if __name__ == "__main__":
     app.run(debug=True)
