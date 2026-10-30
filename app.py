@@ -1,13 +1,38 @@
+import json
+from pathlib import Path
+
 from flask import Flask, jsonify, render_template
 import requests
 
 app = Flask(__name__)
 
-# Edit this list to use your own crags. Coordinates are latitude and longitude.
-CRAGS = [
-    {"id": "siurana", "name": "Siurana (Catalonia)", "lat": 41.2530, "lon": 0.9230},
-    {"id": "montserrat", "name": "Montserrat", "lat": 41.5933, "lon": 1.8081},
-]
+CRAGS_FILE = Path(__file__).parent / "crags.json"
+REQUIRED_CRAG_KEYS = {"id", "name", "lat", "lon", "aspect", "region"}
+
+
+def load_crags():
+    """Read crags.json and check every crag has the fields the app needs."""
+    try:
+        with open(CRAGS_FILE, encoding="utf-8") as f:
+            crags = json.load(f)
+    except FileNotFoundError:
+        raise RuntimeError(f"Crags file not found: {CRAGS_FILE}")
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"{CRAGS_FILE.name} is not valid JSON: {e}")
+
+    if not isinstance(crags, list):
+        raise RuntimeError(f"{CRAGS_FILE.name} must contain a list of crags")
+    for i, crag in enumerate(crags):
+        missing = REQUIRED_CRAG_KEYS - set(crag)
+        if missing:
+            raise RuntimeError(
+                f"Crag #{i + 1} in {CRAGS_FILE.name} is missing: {', '.join(sorted(missing))}"
+            )
+    return crags
+
+
+# Edit crags.json to use your own crags, then restart the app.
+CRAGS = load_crags()
 
 
 def get_forecast(lat, lon):
