@@ -41,6 +41,9 @@ if (data.stale) {
 const mins = Math.round(data.age_seconds / 60);
 box.innerHTML += `<p><em>Live data is unavailable. Showing a forecast from ${mins} minutes ago.</em></p>`;
 }
+if (data.provider && data.provider !== 'open-meteo') {
+box.innerHTML += `<p><em>Data from ${data.provider} (backup source). Rain chance is estimated from forecast rainfall, not a true probability.</em></p>`;
+}
 for (const d of data.days) {
 const cls = d.verdict.startsWith('Too') ? 'Too' : d.verdict;
 box.innerHTML += `<div class="day ${cls}">
