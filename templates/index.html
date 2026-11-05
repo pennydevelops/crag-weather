@@ -47,7 +47,7 @@ box.innerHTML += `<p><em>Data from ${data.provider} (backup source). Rain chance
 for (const d of data.days) {
 const cls = d.verdict.startsWith('Too') ? 'Too' : d.verdict;
 box.innerHTML += `<div class="day ${cls}">
-<strong>${d.date}</strong> &mdash; ${d.verdict}<br>
+<strong>${d.date}${d.from_time ? ' (from ' + d.from_time + ')' : ''}</strong> &mdash; ${d.verdict}<br>
 Temp ${d.temp_min}&deg;C to ${d.temp_max}&deg;C,
 rain chance ${d.rain_chance}%, wind ${d.wind_kmh} km/h
 </div>`;

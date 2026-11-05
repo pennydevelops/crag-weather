@@ -119,10 +119,12 @@ def get_forecast_met(lat, lon, tz_name):
     timeseries = response.json()["properties"]["timeseries"]
 
     tz = ZoneInfo(tz_name)
-    by_date = {}  # local date -> temps, winds (m/s) and rain (mm) for that day
+    by_date = {}  # local date -> first local time, temps, winds (m/s) and rain (mm)
     for point in timeseries:
         local = datetime.fromisoformat(point["time"].replace("Z", "+00:00")).astimezone(tz)
-        day = by_date.setdefault(local.date().isoformat(), {"temps": [], "winds": [], "rain": 0.0})
+        day = by_date.setdefault(local.date().isoformat(), {
+            "first": local.strftime("%H:%M"), "temps": [], "winds": [], "rain": 0.0,
+        })
         data = point["data"]
         details = data["instant"]["details"]
         day["temps"].append(details["air_temperature"])
@@ -135,6 +137,9 @@ def get_forecast_met(lat, lon, tz_name):
     if not dates:
         raise ValueError("MET Norway returned no forecast data")
     rain_mm = [round(by_date[d]["rain"], 1) for d in dates]
+    # MET starts at the current hour, so only the first day can be partial.
+    first = by_date[dates[0]]["first"]
+    from_time = [first if first != "00:00" else None] + [None] * (len(dates) - 1)
     return {
         "time": dates,
         "temperature_2m_max": [max(by_date[d]["temps"]) for d in dates],
@@ -142,6 +147,7 @@ def get_forecast_met(lat, lon, tz_name):
         "precipitation_probability_max": [rain_chance_from_mm(mm) for mm in rain_mm],
         "wind_speed_10m_max": [round(max(by_date[d]["winds"]) * 3.6, 1) for d in dates],  # m/s -> km/h
         "precipitation_sum": rain_mm,
+        "from_time": from_time,
     }
 
 
@@ -174,7 +180,8 @@ def list_crags():
 
 
 def build_days(daily):
-    precip_mm = daily.get("precipitation_sum")  # only the MET fallback supplies this
+    precip_mm = daily.get("precipitation_sum")  # only the MET fallback supplies these
+    from_time = daily.get("from_time")
     days = []
     for i, date in enumerate(daily["time"]):
         rain = daily["precipitation_probability_max"][i]
@@ -183,6 +190,7 @@ def build_days(daily):
         tmin = daily["temperature_2m_min"][i]
         days.append({
             "date": date,
+            "from_time": from_time[i] if from_time else None,
             "temp_max": tmax,
             "temp_min": tmin,
             "rain_chance": rain,
