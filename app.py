@@ -20,6 +20,28 @@ MET_USER_AGENT = "crag-weather/1.0 (https://github.com/pennydevelops/crag-weathe
 FORECAST_DAYS = 3
 RAIN_WET_MM = 2              # MET fallback: this much rain in a day counts as "too wet"
 FETCH_ERRORS = (requests.RequestException, KeyError, IndexError, ValueError)
+PAST_DAYS = 2                # days before today that Open-Meteo also sends (for the rain rule)
+
+# --- Scoring settings: change these numbers to retune the score. -------------
+RAIN_WEIGHT = 0.8            # points lost per 1% rain probability
+WIND_FREE_KMH = 20           # wind up to this costs nothing...
+WIND_WEIGHT = 1.5            # ...above it, points lost per extra km/h
+IDEAL_TEMP_C = 13            # the felt temperature that costs nothing
+TEMP_WEIGHT = 2.5            # points lost per degree away from the ideal
+SEEPAGE_MM = 5               # more rain than this over the 2 days before => wet rock...
+SEEPAGE_PENALTY = 20         # ...on these aspects, which lose this many points
+SEEPAGE_ASPECTS = {"N", "NE", "NW"}
+CLIMBABLE_MIN = 70           # score 70 and up is "Climbable"
+MARGINAL_MIN = 40            # 40 to 69 is "Marginal"; below that is "Poor"
+
+# Degrees added to the air temperature by the sun on a clear day, per aspect.
+ASPECT_ADJUSTMENT = {"S": 6, "SE": 4, "SW": 4, "E": 2, "W": 2, "NE": -1, "NW": -1, "N": -3}
+# "all" means every aspect, in this order. The order also breaks ties between aspects.
+ALL_ASPECTS = ["S", "SE", "SW", "E", "W", "NE", "NW", "N"]
+ASPECT_NAMES = {
+    "S": "south", "SE": "south-east", "SW": "south-west", "E": "east",
+    "W": "west", "NE": "north-east", "NW": "north-west", "N": "north",
+}
 
 # crag id -> {"days": [...], "fetched_at": time.monotonic() value, "provider": str}
 # Lives in this process's memory only, so it is empty after every restart.
@@ -38,7 +60,36 @@ _handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
 log.addHandler(_handler)
 
 CRAGS_FILE = Path(__file__).parent / "crags.json"
-REQUIRED_CRAG_KEYS = {"id", "name", "lat", "lon", "aspect", "region", "timezone"}
+# "aspect" is not required: leaving it out (or empty) means the aspect is unknown.
+REQUIRED_CRAG_KEYS = {"id", "name", "lat", "lon", "region", "timezone"}
+
+
+def parse_aspects(value):
+    """Turn the aspect from crags.json into a list of compass points.
+
+    Accepts "SE", ["N", "S"], "all", or empty/missing (unknown, which gives []).
+    Raises ValueError for anything else, so a typo fails loudly at startup.
+    """
+    if value is None or value == "" or value == []:
+        return []
+    if isinstance(value, str):
+        if value.strip().lower() == "all":
+            return list(ALL_ASPECTS)
+        value = [value]  # a single direction is just a list of one
+    if not isinstance(value, list):
+        raise ValueError(
+            f'aspect must be a direction, a list of directions, or "all", not {value!r}'
+        )
+    aspects = []
+    for item in value:
+        direction = item.strip().upper() if isinstance(item, str) else item
+        if direction not in ALL_ASPECTS:
+            raise ValueError(
+                f'unknown aspect {item!r} (use {", ".join(ALL_ASPECTS)} or "all")'
+            )
+        if direction not in aspects:  # ignore repeats, keep the order given
+            aspects.append(direction)
+    return aspects
 
 
 def load_crags():
@@ -59,6 +110,10 @@ def load_crags():
             raise RuntimeError(
                 f"Crag #{i + 1} in {CRAGS_FILE.name} is missing: {', '.join(sorted(missing))}"
             )
+        try:
+            parse_aspects(crag.get("aspect"))  # only checking it here
+        except ValueError as e:
+            raise RuntimeError(f"Crag #{i + 1} ({crag['id']}) in {CRAGS_FILE.name}: {e}")
     return crags
 
 
@@ -73,13 +128,33 @@ def get_forecast(lat, lon):
         "latitude": lat,
         "longitude": lon,
         "daily": "temperature_2m_max,temperature_2m_min,"
-                 "precipitation_probability_max,wind_speed_10m_max",
+                 "precipitation_probability_max,wind_speed_10m_max,"
+                 "cloud_cover_mean,precipitation_sum",
         "timezone": "auto",
         "forecast_days": 3,
+        "past_days": PAST_DAYS,  # also send the days before today
     }
     response = requests.get(url, params=params, timeout=5)
     response.raise_for_status()  # raise an error if the request failed
-    return response.json()["daily"]
+    return drop_past_days(response.json()["daily"])
+
+
+def drop_past_days(daily):
+    """Work out the rain over the 2 days before each forecast day, then remove the past days.
+
+    Open-Meteo sends the past days first, so each list is 5 long (2 past + today + 2 more).
+    Cutting them off leaves lists of 3, the same shape the rest of the code expects.
+    """
+    if len(daily["time"]) <= PAST_DAYS:
+        raise ValueError("Open-Meteo returned no forecast days")
+    rain = daily["precipitation_sum"]
+    past_rain = []
+    for i in range(PAST_DAYS, len(rain)):
+        window = rain[i - PAST_DAYS:i]  # the 2 days just before day i
+        past_rain.append(None if None in window else round(sum(window), 1))
+    trimmed = {key: values[PAST_DAYS:] for key, values in daily.items()}
+    trimmed["past_rain_mm"] = past_rain
+    return trimmed
 
 
 def get_forecast_with_retry(lat, lon):
@@ -98,7 +173,7 @@ def get_forecast_with_retry(lat, lon):
 def rain_chance_from_mm(mm):
     """MET Norway has no rain probability here, so estimate one from the day's rain.
 
-    Not a real probability: it just lands in the verdict() bands (20 / 60).
+    Not a real probability: 0 / 40 / 80 are picked to land in clearly different score bands.
     """
     if mm <= 0:
         return 0
@@ -123,12 +198,14 @@ def get_forecast_met(lat, lon, tz_name):
     for point in timeseries:
         local = datetime.fromisoformat(point["time"].replace("Z", "+00:00")).astimezone(tz)
         day = by_date.setdefault(local.date().isoformat(), {
-            "first": local.strftime("%H:%M"), "temps": [], "winds": [], "rain": 0.0,
+            "first": local.strftime("%H:%M"), "temps": [], "winds": [], "clouds": [], "rain": 0.0,
         })
         data = point["data"]
         details = data["instant"]["details"]
         day["temps"].append(details["air_temperature"])
         day["winds"].append(details["wind_speed"])
+        if details.get("cloud_area_fraction") is not None:
+            day["clouds"].append(details["cloud_area_fraction"])
         # Hourly points carry next_1_hours; the later 6-hourly ones only next_6_hours.
         period = data.get("next_1_hours") or data.get("next_6_hours") or {}
         day["rain"] += period.get("details", {}).get("precipitation_amount", 0.0)
@@ -147,6 +224,12 @@ def get_forecast_met(lat, lon, tz_name):
         "precipitation_probability_max": [rain_chance_from_mm(mm) for mm in rain_mm],
         "wind_speed_10m_max": [round(max(by_date[d]["winds"]) * 3.6, 1) for d in dates],  # m/s -> km/h
         "precipitation_sum": rain_mm,
+        "cloud_cover_mean": [
+            round(sum(c) / len(c)) if c else None
+            for c in (by_date[d]["clouds"] for d in dates)
+        ],
+        # MET only forecasts, so there is no record of rain before now: unavailable.
+        "past_rain_mm": [None] * len(dates),
         "from_time": from_time,
     }
 
@@ -160,13 +243,76 @@ def fetch_daily(crag):
     return get_forecast_met(crag["lat"], crag["lon"], crag["timezone"]), "met-norway"
 
 
-def verdict(temp_max, temp_min, rain_chance, wind):
-    """Turn numbers into a simple decision."""
-    if rain_chance > 60 or wind > 40:
-        return "Too wet / windy"
-    if rain_chance > 20 or wind > 25 or temp_max > 28 or temp_min < 2:
+def score_aspect(temp_max, rain_chance, wind, cloud_cover, aspect, past_rain_mm):
+    """Score one day for one aspect (aspect=None means unknown).
+
+    Starts from 100 and works out how many points each factor takes off.
+    Returns the penalties, the felt temperature and the unrounded total.
+    """
+    # Sun factor: 1.0 on a clear day, 0.0 under full cloud. No cloud data counts as no sun.
+    sun = (100 - cloud_cover) / 100 if cloud_cover is not None else 0
+    # Felt temperature: the sun only adds the aspect's bonus (or shade penalty);
+    # clouds shrink that bonus, but they don't change the air temperature itself.
+    felt = temp_max + ASPECT_ADJUSTMENT.get(aspect, 0) * sun
+
+    # Wet rock: lots of rain recently AND a damp-prone aspect. If we don't know
+    # how much rain fell (past_rain_mm is None), no penalty is applied.
+    wet_rock = (
+        aspect in SEEPAGE_ASPECTS and past_rain_mm is not None and past_rain_mm > SEEPAGE_MM
+    )
+    penalties = {
+        "rain": rain_chance * RAIN_WEIGHT,
+        "wind": max(0, wind - WIND_FREE_KMH) * WIND_WEIGHT,  # max(0, ...) stops negatives
+        "temperature": abs(felt - IDEAL_TEMP_C) * TEMP_WEIGHT,  # too hot or too cold both cost
+        "seepage": SEEPAGE_PENALTY if wet_rock else 0,
+    }
+    return {"total": 100 - sum(penalties.values()), "felt": felt, "penalties": penalties}
+
+
+def band_for(score):
+    """Turn a whole-number score into a band name."""
+    if score >= CLIMBABLE_MIN:
+        return "Climbable"
+    if score >= MARGINAL_MIN:
         return "Marginal"
-    return "Climbable"
+    return "Poor"
+
+
+def score_day(temp_max, rain_chance, wind, cloud_cover, aspects, past_rain_mm):
+    """Score a day for every aspect the crag has and report the best one.
+
+    `aspects` is a list like ["N", "S"], or [] when the aspect is unknown.
+    """
+    # Unknown aspect: score once, with no sun adjustment and no wet-rock penalty.
+    results = [
+        (a, score_aspect(temp_max, rain_chance, wind, cloud_cover, a, past_rain_mm))
+        for a in (aspects or [None])
+    ]
+    # max() returns the first of any equal scores, so the order in crags.json breaks ties.
+    # Scores are compared to 1 decimal so tiny rounding noise doesn't count as a difference.
+    best_aspect, best = max(results, key=lambda r: round(r[1]["total"], 1))
+
+    # Every aspect scoring the same means orientation makes no difference today.
+    all_equal = len(results) > 1 and all(
+        round(r["total"], 1) == round(best["total"], 1) for _, r in results
+    )
+    if not aspects:
+        aspect, label = None, None
+    elif all_equal:
+        aspect, label = None, "any sector"
+    else:
+        aspect, label = best_aspect, f"{ASPECT_NAMES[best_aspect]}-facing sectors"
+
+    score = round(max(0, min(100, best["total"])))  # keep it between 0 and 100
+    return {
+        "score": score,
+        "band": band_for(score),
+        "penalties": {name: round(points, 1) for name, points in best["penalties"].items()},
+        "felt_temp": round(best["felt"], 1),
+        "aspect": aspect,
+        "aspect_label": label,
+        "aspect_known": bool(aspects),
+    }
 
 
 @app.route("/")
@@ -179,9 +325,12 @@ def list_crags():
     return jsonify(CRAGS)
 
 
-def build_days(daily):
-    precip_mm = daily.get("precipitation_sum")  # only the MET fallback supplies these
-    from_time = daily.get("from_time")
+def build_days(daily, aspects):
+    """Turn a provider's daily lists into one dictionary per day, with its score."""
+    precip_mm = daily["precipitation_sum"]
+    past_rain = daily["past_rain_mm"]
+    clouds = daily["cloud_cover_mean"]
+    from_time = daily.get("from_time")  # only the MET fallback supplies this
     days = []
     for i, date in enumerate(daily["time"]):
         rain = daily["precipitation_probability_max"][i]
@@ -194,9 +343,11 @@ def build_days(daily):
             "temp_max": tmax,
             "temp_min": tmin,
             "rain_chance": rain,
-            "precip_mm": precip_mm[i] if precip_mm else None,
+            "precip_mm": precip_mm[i],
+            "past_rain_mm": past_rain[i],  # None = unavailable from this provider
+            "cloud_cover": clouds[i],
             "wind_kmh": wind,
-            "verdict": verdict(tmax, tmin, rain, wind),
+            **score_day(tmax, rain, wind, clouds[i], aspects, past_rain[i]),
         })
     return days
 
@@ -219,7 +370,7 @@ def get_crag_days(crag):
         log.info("cache miss, fetching %s", crag["id"])
         try:
             daily, provider = fetch_daily(crag)
-            days = build_days(daily)
+            days = build_days(daily, parse_aspects(crag.get("aspect")))
             FORECAST_CACHE[crag["id"]] = {
                 "days": days, "fetched_at": time.monotonic(), "provider": provider,
             }

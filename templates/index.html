@@ -11,7 +11,7 @@ button { margin: 0.25rem; padding: 0.5rem 0.9rem; font-size: 1rem; cursor: point
 .day { border: 1px solid #ccc; border-radius: 8px; padding: 0.75rem; margin: 0.5rem 0; }
 .Climbable { background: #e6f7ea; }
 .Marginal { background: #fff6dc; }
-.Too { background: #fde7e7; }
+.Poor { background: #fde7e7; }
 </style>
 </head>
 <body>
@@ -44,12 +44,17 @@ box.innerHTML += `<p><em>Live data is unavailable. Showing a forecast from ${min
 if (data.provider && data.provider !== 'open-meteo') {
 box.innerHTML += `<p><em>Data from ${data.provider} (backup source). Rain chance is estimated from forecast rainfall, not a true probability.</em></p>`;
 }
+if (data.days.some(d => d.past_rain_mm === null)) {
+box.innerHTML += `<p><em>Rain from the past two days is unavailable from this source, so the wet-rock penalty is not applied. North-facing sectors may be wetter than the score suggests.</em></p>`;
+}
 for (const d of data.days) {
-const cls = d.verdict.startsWith('Too') ? 'Too' : d.verdict;
-box.innerHTML += `<div class="day ${cls}">
-<strong>${d.date}${d.from_time ? ' (from ' + d.from_time + ')' : ''}</strong> &mdash; ${d.verdict}<br>
-Temp ${d.temp_min}&deg;C to ${d.temp_max}&deg;C,
-rain chance ${d.rain_chance}%, wind ${d.wind_kmh} km/h
+const where = d.aspect_label ? ' &mdash; ' + d.aspect_label : '';
+const p = d.penalties;
+box.innerHTML += `<div class="day ${d.band}">
+<strong>${d.date}${d.from_time ? ' (from ' + d.from_time + ')' : ''}</strong> &mdash; ${d.band}${where} (score ${d.score})<br>
+Temp ${d.temp_min}&deg;C to ${d.temp_max}&deg;C (felt ${d.felt_temp}&deg;C),
+rain chance ${d.rain_chance}%, wind ${d.wind_kmh} km/h<br>
+<small>Penalties: rain &minus;${p.rain}, wind &minus;${p.wind}, temperature &minus;${p.temperature}, seepage &minus;${p.seepage}${d.aspect_known ? '' : ' (aspect unknown, no sun adjustment)'}</small>
 </div>`;
 }
 }
