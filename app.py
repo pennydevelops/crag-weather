@@ -1,10 +1,22 @@
 import json
+import logging
+import threading
+import time
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template
 import requests
 
 app = Flask(__name__)
+
+CACHE_TTL = 30 * 60          # seconds a forecast counts as fresh
+RETRY_DELAYS = [2, 5]        # seconds to wait after each 429 before retrying
+FAILURE_COOLDOWN = 60        # seconds to skip Open-Meteo after a failed refresh
+
+# crag id -> {"days": [...], "fetched_at": time.monotonic() value}
+# Lives in this process's memory only, so it is empty after every restart.
+FORECAST_CACHE = {}
+last_failure = None
 
 CRAGS_FILE = Path(__file__).parent / "crags.json"
 REQUIRED_CRAG_KEYS = {"id", "name", "lat", "lon", "aspect", "region"}
@@ -46,9 +58,22 @@ def get_forecast(lat, lon):
         "timezone": "auto",
         "forecast_days": 3,
     }
-    response = requests.get(url, params=params, timeout=10)
+    response = requests.get(url, params=params, timeout=5)
     response.raise_for_status()  # raise an error if the request failed
     return response.json()["daily"]
+
+
+def get_forecast_with_retry(lat, lon):
+    """Call get_forecast, retrying after 2s and then 5s if Open-Meteo says 429."""
+    for delay in RETRY_DELAYS:
+        try:
+            return get_forecast(lat, lon)
+        except requests.HTTPError as e:
+            if e.response is None or e.response.status_code != 429:
+                raise
+            logging.warning("Open-Meteo returned 429, retrying in %ss", delay)
+            time.sleep(delay)
+    return get_forecast(lat, lon)  # last attempt: any error propagates
 
 
 def verdict(temp_max, temp_min, rain_chance, wind):
@@ -70,13 +95,7 @@ def list_crags():
     return jsonify(CRAGS)
 
 
-@app.route("/api/crags/<crag_id>/forecast")
-def crag_forecast(crag_id):
-    crag = next((c for c in CRAGS if c["id"] == crag_id), None)
-    if crag is None:
-        return jsonify({"error": "Unknown crag"}), 404
-
-    daily = get_forecast(crag["lat"], crag["lon"])
+def build_days(daily):
     days = []
     for i, date in enumerate(daily["time"]):
         rain = daily["precipitation_probability_max"][i]
@@ -91,11 +110,68 @@ def crag_forecast(crag_id):
             "wind_kmh": wind,
             "verdict": verdict(tmax, tmin, rain, wind),
         })
-    return jsonify({"crag": crag["name"], "days": days})
+    return days
+
+
+def get_crag_days(crag):
+    """Return (days, age_seconds, stale) for a crag, or None if we have nothing.
+
+    Uses the cache while fresh, otherwise asks Open-Meteo. If that fails (or we
+    are in the cooldown after a recent failure), falls back to stale data.
+    """
+    global last_failure
+    entry = FORECAST_CACHE.get(crag["id"])
+    now = time.monotonic()
+    if entry and now - entry["fetched_at"] < CACHE_TTL:
+        return entry["days"], now - entry["fetched_at"], False
+
+    in_cooldown = last_failure is not None and now - last_failure < FAILURE_COOLDOWN
+    if not in_cooldown:
+        try:
+            daily = get_forecast_with_retry(crag["lat"], crag["lon"])
+            days = build_days(daily)
+            FORECAST_CACHE[crag["id"]] = {"days": days, "fetched_at": time.monotonic()}
+            return days, 0, False
+        except (requests.RequestException, KeyError, IndexError) as e:
+            last_failure = time.monotonic()
+            logging.warning("Forecast refresh failed for %s: %s", crag["id"], e)
+
+    if entry:
+        return entry["days"], time.monotonic() - entry["fetched_at"], True
+    return None
+
+
+@app.route("/api/crags/<crag_id>/forecast")
+def crag_forecast(crag_id):
+    crag = next((c for c in CRAGS if c["id"] == crag_id), None)
+    if crag is None:
+        return jsonify({"error": "Unknown crag"}), 404
+
+    result = get_crag_days(crag)
+    if result is None:
+        return jsonify({
+            "error": "Forecast temporarily unavailable, please try again in a few minutes."
+        }), 503
+
+    days, age, stale = result
+    body = {"crag": crag["name"], "days": days}
+    if stale:
+        body["stale"] = True
+        body["age_seconds"] = round(age)
+    return jsonify(body)
 
 @app.route("/api/break")
 def break_app():
        raise ValueError("Deliberate test error for Dynatrace")
+
+def warm_cache():
+    """Fetch every crag once so the first visitor doesn't wait on Open-Meteo."""
+    for crag in CRAGS:
+        get_crag_days(crag)
+
+
+# Background thread: the app starts serving straight away instead of waiting.
+threading.Thread(target=warm_cache, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(debug=True)
