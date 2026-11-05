@@ -18,6 +18,17 @@ FAILURE_COOLDOWN = 60        # seconds to skip Open-Meteo after a failed refresh
 FORECAST_CACHE = {}
 last_failure = None
 
+# Own logger with its own handler: the root logger only shows warnings and up,
+# so plain logging.info() lines would be invisible under gunicorn.
+# propagate = True also hands each record to the root logger's handlers, which
+# is how OpenTelemetry's log handler picks them up for Dynatrace.
+log = logging.getLogger("crag-weather")
+log.setLevel(logging.INFO)
+log.propagate = True
+_handler = logging.StreamHandler()
+_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+log.addHandler(_handler)
+
 CRAGS_FILE = Path(__file__).parent / "crags.json"
 REQUIRED_CRAG_KEYS = {"id", "name", "lat", "lon", "aspect", "region"}
 
@@ -71,7 +82,7 @@ def get_forecast_with_retry(lat, lon):
         except requests.HTTPError as e:
             if e.response is None or e.response.status_code != 429:
                 raise
-            logging.warning("Open-Meteo returned 429, retrying in %ss", delay)
+            log.warning("Open-Meteo returned 429, retrying in %ss", delay)
             time.sleep(delay)
     return get_forecast(lat, lon)  # last attempt: any error propagates
 
@@ -123,10 +134,12 @@ def get_crag_days(crag):
     entry = FORECAST_CACHE.get(crag["id"])
     now = time.monotonic()
     if entry and now - entry["fetched_at"] < CACHE_TTL:
+        log.info("cache hit %s (age %ds)", crag["id"], now - entry["fetched_at"])
         return entry["days"], now - entry["fetched_at"], False
 
     in_cooldown = last_failure is not None and now - last_failure < FAILURE_COOLDOWN
     if not in_cooldown:
+        log.info("cache miss, fetching %s", crag["id"])
         try:
             daily = get_forecast_with_retry(crag["lat"], crag["lon"])
             days = build_days(daily)
@@ -134,10 +147,12 @@ def get_crag_days(crag):
             return days, 0, False
         except (requests.RequestException, KeyError, IndexError) as e:
             last_failure = time.monotonic()
-            logging.warning("Forecast refresh failed for %s: %s", crag["id"], e)
+            log.warning("Forecast refresh failed for %s: %s", crag["id"], e)
 
     if entry:
-        return entry["days"], time.monotonic() - entry["fetched_at"], True
+        age = time.monotonic() - entry["fetched_at"]
+        log.info("serving stale %s (age %ds)", crag["id"], age)
+        return entry["days"], age, True
     return None
 
 
